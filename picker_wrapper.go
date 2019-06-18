@@ -69,9 +69,12 @@ func (bp *pickerWrapper) updatePicker(p balancer.Picker) {
 		bp.mu.Unlock()
 		return
 	}
+	// 更新新的Picker
 	bp.picker = p
 	// bp.blockingCh should never be nil.
+	// close原来的channel
 	close(bp.blockingCh)
+	// 重新创建
 	bp.blockingCh = make(chan struct{})
 	bp.mu.Unlock()
 }

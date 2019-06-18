@@ -165,15 +165,21 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 			}
 		}()
 	}
+
+	// 获取一个callInfo
 	c := defaultCallInfo()
+
 	// Provide an opportunity for the first RPC to see the first service config
 	// provided by the resolver.
+	// 等待服务地址初始化
 	if err := cc.waitForResolvedAddrs(ctx); err != nil {
 		return nil, err
 	}
+
+	// 根据方法名从serviceConfig中获取methodConfig
 	mc := cc.GetMethodConfig(method)
 	if mc.WaitForReady != nil {
-		c.failFast = !*mc.WaitForReady
+		c.failFast = !*mc.WaitForReady // 是否等待连接ready
 	}
 
 	// Possible context leak:
@@ -193,6 +199,7 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 		}
 	}()
 
+	// 执行options的before，参数为callInfo
 	for _, o := range opts {
 		if err := o.before(c); err != nil {
 			return nil, toRPCErr(err)
@@ -200,10 +207,12 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 	}
 	c.maxSendMessageSize = getMaxSize(mc.MaxReqSize, c.maxSendMessageSize, defaultClientMaxSendMessageSize)
 	c.maxReceiveMessageSize = getMaxSize(mc.MaxRespSize, c.maxReceiveMessageSize, defaultClientMaxReceiveMessageSize)
+	// 如果还没有设置codec，根据callInfo.contentSubtype设置编解码器
 	if err := setCallInfoCodec(c); err != nil {
 		return nil, err
 	}
 
+	// 远程rpc的服务对象，grpc基于http2，当发起rpc调用时，这些数据保存在header中
 	callHdr := &transport.CallHdr{
 		Host:           cc.authority,
 		Method:         method,
@@ -216,6 +225,8 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 	// if set.
 	var cp Compressor
 	var comp encoding.Compressor
+	// 设置compressor
+	// 如果callInfo中指定了压缩类型
 	if ct := c.compressorType; ct != "" {
 		callHdr.SendCompress = ct
 		if ct != encoding.Identity {
@@ -224,13 +235,16 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 				return nil, status.Errorf(codes.Internal, "grpc: Compressor is not installed for requested grpc-encoding %q", ct)
 			}
 		}
-	} else if cc.dopts.cp != nil {
+	} else if cc.dopts.cp != nil { // 如果ClientConn的options中指定了压缩类型
 		callHdr.SendCompress = cc.dopts.cp.Type()
 		cp = cc.dopts.cp
 	}
+
 	if c.creds != nil {
 		callHdr.Creds = c.creds
 	}
+
+	// 追踪信息
 	var trInfo *traceInfo
 	if EnableTracing {
 		trInfo = &traceInfo{
@@ -245,7 +259,10 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 		trInfo.tr.LazyLog(&trInfo.firstLine, false)
 		ctx = trace.NewContext(ctx, trInfo.tr)
 	}
+
+	// 根据rpc信息创建context，保存一些内容到context中
 	ctx = newContextWithRPCInfo(ctx, c.failFast, c.codec, cp, comp)
+	// 统计
 	sh := cc.dopts.copts.StatsHandler
 	var beginTime time.Time
 	if sh != nil {
@@ -259,6 +276,7 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 		sh.HandleRPC(ctx, begin)
 	}
 
+	// stream
 	cs := &clientStream{
 		callHdr:      callHdr,
 		ctx:          ctx,
@@ -274,25 +292,34 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 		beginTime:    beginTime,
 		firstAttempt: true,
 	}
+
+	// 如果允许retry
 	if !cc.dopts.disableRetry {
 		cs.retryThrottler = cc.retryThrottler.Load().(*retryThrottler)
 	}
+
 	cs.binlog = binarylog.GetMethodLogger(method)
 
 	cs.callInfo.stream = cs
 	// Only this initial attempt has stats/tracing.
 	// TODO(dfawley): move to newAttempt when per-attempt stats are implemented.
+	// 创建csAttempt，其中使用picker选择一条transport
+	// csAttempt封装了网络操作，包括创建stream、send和recv等，结合clientStream的withRetry提供retry功能
 	if err := cs.newAttemptLocked(sh, trInfo); err != nil {
 		cs.finish(err)
 		return nil, err
 	}
 
+	// op通过csAttempt创建http2 stream，这里的a.newStream，创建一条stream并设置请求头部信息
 	op := func(a *csAttempt) error { return a.newStream() }
+	// 创建http2 stream
 	if err := cs.withRetry(op, func() { cs.bufferForRetryLocked(0, op) }); err != nil {
+		// 关闭stream
 		cs.finish(err)
 		return nil, err
 	}
 
+	// 日志记录
 	if cs.binlog != nil {
 		md, _ := metadata.FromOutgoingContext(ctx)
 		logEntry := &binarylog.ClientHeader{
@@ -310,6 +337,7 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 		cs.binlog.Log(logEntry)
 	}
 
+	// 如果创建的不是unaryStream，即需要使用stream rpc，当用户close掉ClientConn或者cancel，或者出现错误，需要结束stream
 	if desc != unaryStreamDesc {
 		// Listen on cc and stream contexts to cleanup when the user closes the
 		// ClientConn or cancels the stream context.  In all other cases, an error
@@ -339,6 +367,7 @@ func (cs *clientStream) newAttemptLocked(sh stats.Handler, trInfo *traceInfo) er
 	if err := cs.ctx.Err(); err != nil {
 		return toRPCErr(err)
 	}
+	// picker根据负载均衡策略选择一条transport
 	t, done, err := cs.cc.getTransport(cs.ctx, cs.callInfo.failFast, cs.callHdr.Method)
 	if err != nil {
 		return err
@@ -354,6 +383,7 @@ func (cs *clientStream) newAttemptLocked(sh stats.Handler, trInfo *traceInfo) er
 func (a *csAttempt) newStream() error {
 	cs := a.cs
 	cs.callHdr.PreviousAttempts = cs.numRetries
+	// 创建stream并设置请求头部，ctx中的metadata(通过metadata.FromOutgoingContextRaw获取)会作为header内容发送到client端
 	s, err := a.t.NewStream(cs.ctx, cs.callHdr)
 	if err != nil {
 		return toRPCErr(err)
@@ -660,6 +690,7 @@ func (cs *clientStream) bufferForRetryLocked(sz int, op func(a *csAttempt) error
 	cs.buffer = append(cs.buffer, op)
 }
 
+//
 func (cs *clientStream) SendMsg(m interface{}) (err error) {
 	defer func() {
 		if err != nil && err != io.EOF {
@@ -674,6 +705,8 @@ func (cs *clientStream) SendMsg(m interface{}) (err error) {
 	if cs.sentLast {
 		return status.Errorf(codes.Internal, "SendMsg called after CloseSend")
 	}
+
+	// 如果client端不是stream rpc
 	if !cs.desc.ClientStreams {
 		cs.sentLast = true
 	}
@@ -726,6 +759,7 @@ func (cs *clientStream) RecvMsg(m interface{}) error {
 	}
 	if err != nil || !cs.desc.ServerStreams {
 		// err != nil or non-server-streaming indicates end of stream.
+		// 调用opts的after方法
 		cs.finish(err)
 
 		if cs.binlog != nil {
@@ -809,6 +843,7 @@ func (cs *clientStream) finish(err error) {
 	}
 	// after functions all rely upon having a stream.
 	if cs.attempt.s != nil {
+		// 调用opts的after方法
 		for _, o := range cs.opts {
 			o.after(cs.callInfo)
 		}
@@ -929,11 +964,13 @@ func (a *csAttempt) finish(err error) {
 		tr = a.s.Trailer()
 	}
 
+	// done是Picker的回调接口
 	if a.done != nil {
 		br := false
 		if a.s != nil {
 			br = a.s.BytesReceived()
 		}
+		// 通知Picker请求结束了，Picker可以根据本次调用的信息来调整负载均衡策略
 		a.done(balancer.DoneInfo{
 			Err:           err,
 			Trailer:       tr,

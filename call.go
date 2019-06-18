@@ -29,11 +29,15 @@ import (
 func (cc *ClientConn) Invoke(ctx context.Context, method string, args, reply interface{}, opts ...CallOption) error {
 	// allow interceptor to see all applicable call options, which means those
 	// configured as defaults from dial option as well as per-call options
+	// 合并options
 	opts = combine(cc.dopts.callOptions, opts)
 
+	// 如果存在interceptor，先执行interceptor，最后再执行invoke
+	// 基于interceptor可以构造middleware
 	if cc.dopts.unaryInt != nil {
 		return cc.dopts.unaryInt(ctx, method, args, reply, cc, invoke, opts...)
 	}
+	// 否则直接执行远程rpc
 	return invoke(ctx, method, args, reply, cc, opts...)
 }
 
@@ -62,13 +66,22 @@ func Invoke(ctx context.Context, method string, args, reply interface{}, cc *Cli
 
 var unaryStreamDesc = &StreamDesc{ServerStreams: false, ClientStreams: false}
 
+// ctx: 可以通过ctx设置metadata，通过header传到服务端
+// method: 调用的rpc方法，比如'/proto.EchoSvc/Echo'
+// req: 请求参数
+// reply: 用于接收返回值
+// cc: ClientConn
+// opts: 提供before回调和after回调，可以在after回调中获取header和trailer信息
 func invoke(ctx context.Context, method string, req, reply interface{}, cc *ClientConn, opts ...CallOption) error {
+	// 创建Stream，并设置header，header包括rpc目标服务信息和ctx中的metadata
 	cs, err := newClientStream(ctx, unaryStreamDesc, cc, method, opts...)
 	if err != nil {
 		return err
 	}
+	// 发送请求参数
 	if err := cs.SendMsg(req); err != nil {
 		return err
 	}
+	// 接收响应内容
 	return cs.RecvMsg(reply)
 }

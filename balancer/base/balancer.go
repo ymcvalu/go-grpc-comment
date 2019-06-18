@@ -76,6 +76,7 @@ func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) {
 	grpclog.Infoln("base.baseBalancer: got new ClientConn state: ", s)
 	// addrsSet is the set converted from addrs, it's used for quick lookup of an address.
 	addrsSet := make(map[resolver.Address]struct{})
+	// 为新的addr创建subConn
 	for _, a := range s.ResolverState.Addresses {
 		addrsSet[a] = struct{}{}
 		if _, ok := b.subConns[a]; !ok {
@@ -90,6 +91,7 @@ func (b *baseBalancer) UpdateClientConnState(s balancer.ClientConnState) {
 			sc.Connect()
 		}
 	}
+	// 移除无效addr
 	for a, sc := range b.subConns {
 		// a was removed by resolver.
 		if _, ok := addrsSet[a]; !ok {

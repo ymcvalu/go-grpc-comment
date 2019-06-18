@@ -121,23 +121,29 @@ func Dial(target string, opts ...DialOption) (*ClientConn, error) {
 // The target name syntax is defined in
 // https://github.com/grpc/grpc/blob/master/doc/naming.md.
 // e.g. to use dns resolver, a "dns:///" prefix should be applied to the target.
+
+// 创建ClientConn
 func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *ClientConn, err error) {
 	cc := &ClientConn{
-		target:            target,
-		csMgr:             &connectivityStateManager{},
-		conns:             make(map[*addrConn]struct{}),
-		dopts:             defaultDialOptions(),
-		blockingpicker:    newPickerWrapper(),
+		target:            target,                       // target
+		csMgr:             &connectivityStateManager{},  // 连接状态管理器
+		conns:             make(map[*addrConn]struct{}), // 连接
+		dopts:             defaultDialOptions(),         // options
+		blockingpicker:    newPickerWrapper(),           // balancer.Picker的wrapper
 		czData:            new(channelzData),
 		firstResolveEvent: grpcsync.NewEvent(),
 	}
+
+	// retry
 	cc.retryThrottler.Store((*retryThrottler)(nil))
 	cc.ctx, cc.cancel = context.WithCancel(context.Background())
 
+	// 应用options
 	for _, opt := range opts {
 		opt.apply(&cc.dopts)
 	}
 
+	// 如果存在多个Interceptors，则chain成一个
 	chainUnaryClientInterceptors(cc)
 	chainStreamClientInterceptors(cc)
 
@@ -533,6 +539,7 @@ func (cc *ClientConn) waitForResolvedAddrs(ctx context.Context) error {
 	}
 }
 
+// 更新ClientConn的地址和ServiceConfig
 func (cc *ClientConn) updateResolverState(s resolver.State) error {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
@@ -543,19 +550,25 @@ func (cc *ClientConn) updateResolverState(s resolver.State) error {
 		return nil
 	}
 
+	// state中的ServiceConfig为空或者ServiceConfig被disable
 	if cc.dopts.disableServiceConfig || s.ServiceConfig == nil {
+		// 如果存在defaultServiceConfig，则应用defaultServiceConfig
 		if cc.dopts.defaultServiceConfig != nil && cc.sc == nil {
 			cc.applyServiceConfig(cc.dopts.defaultServiceConfig)
 		}
-	} else if sc, ok := s.ServiceConfig.(*ServiceConfig); ok {
+	} else if sc, ok := s.ServiceConfig.(*ServiceConfig); ok { // 应用新的config
+		// 应用ServiceConfig
 		cc.applyServiceConfig(sc)
 	}
 
+	// 负载均衡配置
 	var balCfg serviceconfig.LoadBalancingConfig
+	// 如果options中没有指定balancerBuilder，则根据serviceConfig更新balancer
 	if cc.dopts.balancerBuilder == nil {
 		// Only look at balancer types and switch balancer if balancer dial
 		// option is not set.
 		var newBalancerName string
+		// 如果serviceConfig中指定了负载均衡器配置
 		if cc.sc != nil && cc.sc.lbConfig != nil {
 			newBalancerName = cc.sc.lbConfig.name
 			balCfg = cc.sc.lbConfig.cfg
@@ -567,22 +580,25 @@ func (cc *ClientConn) updateResolverState(s resolver.State) error {
 					break
 				}
 			}
+			// 存在grpclb类型的addr，使用grpclb负载均衡器
 			if isGRPCLB {
 				newBalancerName = grpclbName
-			} else if cc.sc != nil && cc.sc.LB != nil {
+			} else if cc.sc != nil && cc.sc.LB != nil { // 如果配置中指定了负载均衡器
 				newBalancerName = *cc.sc.LB
 			} else {
-				newBalancerName = PickFirstBalancerName
+				newBalancerName = PickFirstBalancerName // 默认使用pickFirst
 			}
 		}
+		// 使用新的负载均衡器
 		cc.switchBalancer(newBalancerName)
-	} else if cc.balancerWrapper == nil {
+	} else if cc.balancerWrapper == nil { // options指定了balancerBuilder但是还没有初始化
 		// Balancer dial option was set, and this is the first time handling
 		// resolved addresses. Build a balancer with dopts.balancerBuilder.
 		cc.curBalancerName = cc.dopts.balancerBuilder.Name()
 		cc.balancerWrapper = newCCBalancerWrapper(cc, cc.dopts.balancerBuilder, cc.balancerBuildOpts)
 	}
 
+	// 通知变更
 	cc.balancerWrapper.updateClientConnState(&balancer.ClientConnState{ResolverState: s, BalancerConfig: balCfg})
 	return nil
 }
@@ -595,20 +611,24 @@ func (cc *ClientConn) updateResolverState(s resolver.State) error {
 // this function returns.
 //
 // Caller must hold cc.mu.
+// 更换当前balancer
 func (cc *ClientConn) switchBalancer(name string) {
 	if strings.EqualFold(cc.curBalancerName, name) {
 		return
 	}
 
 	grpclog.Infof("ClientConn switching balancer to %q", name)
+	// 如果options指定了balancerBuilder，则以options的为主，直接返回
 	if cc.dopts.balancerBuilder != nil {
 		grpclog.Infoln("ignoring balancer switching: Balancer DialOption used instead")
 		return
 	}
+	// close原来的balancer
 	if cc.balancerWrapper != nil {
 		cc.balancerWrapper.close()
 	}
 
+	// 获取新的balancer对应的builder
 	builder := balancer.Get(name)
 	if channelz.IsOn() {
 		if builder == nil {
@@ -623,13 +643,14 @@ func (cc *ClientConn) switchBalancer(name string) {
 			})
 		}
 	}
+	// 无对应的balancer，默认使用Pickfirse
 	if builder == nil {
 		grpclog.Infof("failed to get balancer builder for: %v, using pick_first instead", name)
 		builder = newPickfirstBuilder()
 	}
 
-	cc.curBalancerName = builder.Name()
-	cc.balancerWrapper = newCCBalancerWrapper(cc, builder, cc.balancerBuildOpts)
+	cc.curBalancerName = builder.Name()                                          // 设置新的balancerName
+	cc.balancerWrapper = newCCBalancerWrapper(cc, builder, cc.balancerBuildOpts) // 创建balancerWrapper
 }
 
 func (cc *ClientConn) handleSubConnStateChange(sc balancer.SubConn, s connectivity.State) {
@@ -649,13 +670,14 @@ func (cc *ClientConn) handleSubConnStateChange(sc balancer.SubConn, s connectivi
 // Caller needs to make sure len(addrs) > 0.
 func (cc *ClientConn) newAddrConn(addrs []resolver.Address, opts balancer.NewSubConnOptions) (*addrConn, error) {
 	ac := &addrConn{
-		cc:           cc,
-		addrs:        addrs,
+		cc:           cc,    // ClientConn
+		addrs:        addrs, // 地址
 		scopts:       opts,
 		dopts:        cc.dopts,
 		czData:       new(channelzData),
 		resetBackoff: make(chan struct{}),
 	}
+	// context和cancel
 	ac.ctx, ac.cancel = context.WithCancel(cc.ctx)
 	// Track ac in cc. This needs to be done before any getTransport(...) is called.
 	cc.mu.Lock()
@@ -674,6 +696,7 @@ func (cc *ClientConn) newAddrConn(addrs []resolver.Address, opts balancer.NewSub
 			},
 		})
 	}
+	// 保存到ClientConn中
 	cc.conns[ac] = struct{}{}
 	cc.mu.Unlock()
 	return ac, nil
@@ -727,20 +750,24 @@ func (cc *ClientConn) incrCallsFailed() {
 // TODO(bar) Move this to the addrConn section.
 func (ac *addrConn) connect() error {
 	ac.mu.Lock()
+	// 如果状态是Shutdown，不允许连接，保错
 	if ac.state == connectivity.Shutdown {
 		ac.mu.Unlock()
 		return errConnClosing
 	}
+	// 如果状态不是Idle，表示已经连接，直接返回
 	if ac.state != connectivity.Idle {
 		ac.mu.Unlock()
 		return nil
 	}
 	// Update connectivity state within the lock to prevent subsequent or
 	// concurrent calls from resetting the transport more than once.
+	// 更新状态为Connecting
 	ac.updateConnectivityState(connectivity.Connecting)
 	ac.mu.Unlock()
 
 	// Start a goroutine connecting to the server asynchronously.
+	// 异步启动一个协程去连接服务
 	go ac.resetTransport()
 	return nil
 }
@@ -823,6 +850,7 @@ func (cc *ClientConn) healthCheckConfig() *healthCheckConfig {
 }
 
 func (cc *ClientConn) getTransport(ctx context.Context, failfast bool, method string) (transport.ClientTransport, func(balancer.DoneInfo), error) {
+	// picker选择一条来连接
 	t, done, err := cc.blockingpicker.pick(ctx, failfast, balancer.PickOptions{
 		FullMethodName: method,
 	})
@@ -969,6 +997,7 @@ func (ac *addrConn) updateConnectivityState(s connectivity.State) {
 	}
 
 	updateMsg := fmt.Sprintf("Subchannel Connectivity change to %v", s)
+	// 状态变更
 	ac.state = s
 	if channelz.IsOn() {
 		channelz.AddTraceEvent(ac.channelzID, &channelz.TraceEventDesc{
@@ -976,6 +1005,7 @@ func (ac *addrConn) updateConnectivityState(s connectivity.State) {
 			Severity: channelz.CtINFO,
 		})
 	}
+	// 调用ClientConn的SubConn状态变更回调
 	ac.cc.handleSubConnStateChange(ac.acbw, s)
 }
 
@@ -995,16 +1025,18 @@ func (ac *addrConn) adjustParams(r transport.GoAwayReason) {
 
 func (ac *addrConn) resetTransport() {
 	for i := 0; ; i++ {
+		// 如果发生重试，则手动触发重新resolve
 		if i > 0 {
 			ac.cc.resolveNow(resolver.ResolveNowOption{})
 		}
 
 		ac.mu.Lock()
+		// 如果ac的状态变更为Shutdown，Shutdown表示该addrConn已经移除掉了
 		if ac.state == connectivity.Shutdown {
 			ac.mu.Unlock()
 			return
 		}
-
+		// 要连接的addr
 		addrs := ac.addrs
 		backoffFor := ac.dopts.bs.Backoff(ac.backoffIdx)
 		// This will be the duration that dial gets to finish.
@@ -1024,26 +1056,29 @@ func (ac *addrConn) resetTransport() {
 		// The spec doesn't mention what should be done for multiple addresses.
 		// https://github.com/grpc/grpc/blob/master/doc/connection-backoff.md#proposed-backoff-algorithm
 		connectDeadline := time.Now().Add(dialDuration)
-
+		// 更新状态为Connecting
 		ac.updateConnectivityState(connectivity.Connecting)
 		ac.transport = nil
 		ac.mu.Unlock()
 
+		// 尝试创建连接，只要一个addr成功立即返回
 		newTr, addr, reconnect, err := ac.tryAllAddrs(addrs, connectDeadline)
-		if err != nil {
+		if err != nil { // 创建失败
 			// After exhausting all addresses, the addrConn enters
 			// TRANSIENT_FAILURE.
 			ac.mu.Lock()
+			// 已经Shutdown
 			if ac.state == connectivity.Shutdown {
 				ac.mu.Unlock()
 				return
 			}
+			// 更新状态为TransientFailure，表示出现错误，但是期待恢复
 			ac.updateConnectivityState(connectivity.TransientFailure)
 
 			// Backoff.
 			b := ac.resetBackoff
 			ac.mu.Unlock()
-
+			// sleep一下，然后重试
 			timer := time.NewTimer(backoffFor)
 			select {
 			case <-timer.C:
@@ -1059,34 +1094,44 @@ func (ac *addrConn) resetTransport() {
 			continue
 		}
 
+		// 这里表示已经创建连接成功
+
 		ac.mu.Lock()
+		// 双重检查，是否已经Shutdown
 		if ac.state == connectivity.Shutdown {
 			newTr.Close()
 			ac.mu.Unlock()
 			return
 		}
+		// 当前连接的addr
 		ac.curAddr = addr
+		// transport
 		ac.transport = newTr
 		ac.backoffIdx = 0
-
+		// 健康检查配置
 		healthCheckConfig := ac.cc.healthCheckConfig()
 		// LB channel health checking is only enabled when all the four requirements below are met:
 		// 1. it is not disabled by the user with the WithDisableHealthCheck DialOption,
 		// 2. the internal.HealthCheckFunc is set by importing the grpc/healthcheck package,
 		// 3. a service config with non-empty healthCheckConfig field is provided,
 		// 4. the current load balancer allows it.
+		// 创建用于健康检查的context
 		hctx, hcancel := context.WithCancel(ac.ctx)
 		healthcheckManagingState := false
+		// 如果启用了健康检查
 		if !ac.cc.dopts.disableHealthCheck && healthCheckConfig != nil && ac.scopts.HealthCheckEnabled {
 			if ac.cc.dopts.healthCheckFunc == nil {
 				// TODO: add a link to the health check doc in the error message.
 				grpclog.Error("the client side LB channel health check function has not been set.")
 			} else {
 				// TODO(deklerk) refactor to just return transport
+				// 开启监控检查
 				go ac.startHealthCheck(hctx, newTr, addr, healthCheckConfig.ServiceName)
 				healthcheckManagingState = true
 			}
 		}
+
+		// 如果没有健康检查，则立即更新连接状态为Ready
 		if !healthcheckManagingState {
 			ac.updateConnectivityState(connectivity.Ready)
 		}
@@ -1094,7 +1139,9 @@ func (ac *addrConn) resetTransport() {
 
 		// Block until the created transport is down. And when this happens,
 		// we restart from the top of the addr list.
+		// 阻塞等待连接down掉，重连
 		<-reconnect.Done()
+		// 连接已经down掉，取消健康检查
 		hcancel()
 
 		// Need to reconnect after a READY, the addrConn enters
@@ -1104,10 +1151,12 @@ func (ac *addrConn) resetTransport() {
 		// of time, and turns CONNECTING. It seems reasonable to skip this, but
 		// READY-CONNECTING is not a valid transition.
 		ac.mu.Lock()
+		// 如果已经Shutdown
 		if ac.state == connectivity.Shutdown {
 			ac.mu.Unlock()
 			return
 		}
+		// 更新状态为TransientFailure，重新连接
 		ac.updateConnectivityState(connectivity.TransientFailure)
 		ac.mu.Unlock()
 	}
@@ -1117,8 +1166,10 @@ func (ac *addrConn) resetTransport() {
 // first successful one. It returns the transport, the address and a Event in
 // the successful case. The Event fires when the returned transport disconnects.
 func (ac *addrConn) tryAllAddrs(addrs []resolver.Address, connectDeadline time.Time) (transport.ClientTransport, resolver.Address, *grpcsync.Event, error) {
+	// 遍历addrs
 	for _, addr := range addrs {
 		ac.mu.Lock()
+		// 如果addrConn已经Shutdown
 		if ac.state == connectivity.Shutdown {
 			ac.mu.Unlock()
 			return nil, resolver.Address{}, nil, errConnClosing
@@ -1141,7 +1192,9 @@ func (ac *addrConn) tryAllAddrs(addrs []resolver.Address, connectDeadline time.T
 			})
 		}
 
+		// 创建连接
 		newTr, reconnect, err := ac.createTransport(addr, copts, connectDeadline)
+		// 创建成功
 		if err == nil {
 			return newTr, addr, reconnect, nil
 		}
@@ -1149,6 +1202,7 @@ func (ac *addrConn) tryAllAddrs(addrs []resolver.Address, connectDeadline time.T
 	}
 
 	// Couldn't connect to any address.
+	// 创建失败
 	return nil, resolver.Address{}, nil, fmt.Errorf("couldn't connect to any address")
 }
 
@@ -1213,28 +1267,36 @@ func (ac *addrConn) createTransport(addr resolver.Address, copts transport.Conne
 	return newTr, reconnect, nil
 }
 
+// 开启健康检查
 func (ac *addrConn) startHealthCheck(ctx context.Context, newTr transport.ClientTransport, addr resolver.Address, serviceName string) {
 	// Set up the health check helper functions
+	// 该方法用于创建新的stream
 	newStream := func() (interface{}, error) {
 		return ac.newClientStream(ctx, &StreamDesc{ServerStreams: true}, "/grpc.health.v1.Health/Watch", newTr)
 	}
 	firstReady := true
+	// 报告健康检查结果
 	reportHealth := func(ok bool) {
 		ac.mu.Lock()
 		defer ac.mu.Unlock()
+		// 如果transport已经变更了，直接返回
 		if ac.transport != newTr {
 			return
 		}
+		// 健康检查成功
 		if ok {
 			if firstReady {
 				firstReady = false
 				ac.curAddr = addr
 			}
+			// 更新状态为Ready
 			ac.updateConnectivityState(connectivity.Ready)
 		} else {
+			// 更新状态为TransientFailure
 			ac.updateConnectivityState(connectivity.TransientFailure)
 		}
 	}
+	// 执行健康检查
 	err := ac.cc.dopts.healthCheckFunc(ctx, newStream, reportHealth, serviceName)
 	if err != nil {
 		if status.Code(err) == codes.Unimplemented {

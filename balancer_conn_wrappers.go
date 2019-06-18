@@ -85,8 +85,8 @@ func (b *scStateUpdateBuffer) get() <-chan *scStateUpdate {
 // ccBalancerWrapper is a wrapper on top of cc for balancers.
 // It implements balancer.ClientConn interface.
 type ccBalancerWrapper struct {
-	cc               *ClientConn
-	balancer         balancer.Balancer
+	cc               *ClientConn       // ClientConn
+	balancer         balancer.Balancer // balancer
 	stateChangeQueue *scStateUpdateBuffer
 	ccUpdateCh       chan *balancer.ClientConnState
 	done             chan struct{}
@@ -96,6 +96,7 @@ type ccBalancerWrapper struct {
 }
 
 func newCCBalancerWrapper(cc *ClientConn, b balancer.Builder, bopts balancer.BuildOptions) *ccBalancerWrapper {
+	// wrapper
 	ccb := &ccBalancerWrapper{
 		cc:               cc,
 		stateChangeQueue: newSCStateUpdateBuffer(),
@@ -103,7 +104,9 @@ func newCCBalancerWrapper(cc *ClientConn, b balancer.Builder, bopts balancer.Bui
 		done:             make(chan struct{}),
 		subConns:         make(map[*acBalancerWrapper]struct{}),
 	}
+	// 启动子协程监听
 	go ccb.watcher()
+	// build一个新的balancer
 	ccb.balancer = b.Build(ccb, bopts)
 	return ccb
 }
@@ -121,6 +124,7 @@ func (ccb *ccBalancerWrapper) watcher() {
 				return
 			default:
 			}
+			// V2Balancer是新版的Balancer接口
 			if ub, ok := ccb.balancer.(balancer.V2Balancer); ok {
 				ub.UpdateSubConnState(t.sc, balancer.SubConnState{ConnectivityState: t.state})
 			} else {
@@ -155,6 +159,7 @@ func (ccb *ccBalancerWrapper) watcher() {
 			return
 		default:
 		}
+		// Fire结束事件
 		ccb.cc.firstResolveEvent.Fire()
 	}
 }
@@ -183,6 +188,7 @@ func (ccb *ccBalancerWrapper) handleSubConnStateChange(sc balancer.SubConn, s co
 func (ccb *ccBalancerWrapper) updateClientConnState(ccs *balancer.ClientConnState) {
 	if ccb.cc.curBalancerName != grpclbName {
 		// Filter any grpclb addresses since we don't have the grpclb balancer.
+		// 过滤掉grpclb类型的addr
 		s := ccs.ResolverState
 		for i := 0; i < len(s.Addresses); {
 			if s.Addresses[i].Type == resolver.GRPCLB {
@@ -194,12 +200,15 @@ func (ccb *ccBalancerWrapper) updateClientConnState(ccs *balancer.ClientConnStat
 		}
 	}
 	select {
+	// 原先的update事件可能还没来得及被消费，移除
 	case <-ccb.ccUpdateCh:
 	default:
 	}
+	// 通知update
 	ccb.ccUpdateCh <- ccs
 }
 
+// 根据addr创建SubConn
 func (ccb *ccBalancerWrapper) NewSubConn(addrs []resolver.Address, opts balancer.NewSubConnOptions) (balancer.SubConn, error) {
 	if len(addrs) <= 0 {
 		return nil, fmt.Errorf("grpc: cannot create SubConn with empty address list")
@@ -209,10 +218,12 @@ func (ccb *ccBalancerWrapper) NewSubConn(addrs []resolver.Address, opts balancer
 	if ccb.subConns == nil {
 		return nil, fmt.Errorf("grpc: ClientConn balancer wrapper was closed")
 	}
+	// ClientConn创建新的addrConn
 	ac, err := ccb.cc.newAddrConn(addrs, opts)
 	if err != nil {
 		return nil, err
 	}
+	// 包装
 	acbw := &acBalancerWrapper{ac: ac}
 	acbw.ac.mu.Lock()
 	ac.acbw = acbw
@@ -235,6 +246,7 @@ func (ccb *ccBalancerWrapper) RemoveSubConn(sc balancer.SubConn) {
 	ccb.cc.removeAddrConn(acbw.getAddrConn(), errConnDrain)
 }
 
+// Balancer回调，当有新的连接Ready时，重新生成Picker然后回调该接口
 func (ccb *ccBalancerWrapper) UpdateBalancerState(s connectivity.State, p balancer.Picker) {
 	ccb.mu.Lock()
 	defer ccb.mu.Unlock()
@@ -305,6 +317,7 @@ func (acbw *acBalancerWrapper) UpdateAddresses(addrs []resolver.Address) {
 	}
 }
 
+// 调用addrConn的connect
 func (acbw *acBalancerWrapper) Connect() {
 	acbw.mu.Lock()
 	defer acbw.mu.Unlock()
