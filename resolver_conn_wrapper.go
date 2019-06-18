@@ -79,6 +79,8 @@ func newCCResolverWrapper(cc *ClientConn) (*ccResolverWrapper, error) {
 		return nil, fmt.Errorf("could not get resolver for scheme: %q", cc.parsedTarget.Scheme)
 	}
 
+	// resolver的wrapper
+	// ccResolverWrapper实现了resolver.ClientConn接口，提供resovler的回调接口
 	ccr := &ccResolverWrapper{
 		cc:     cc,
 		addrCh: make(chan []resolver.Address, 1),
@@ -86,6 +88,7 @@ func newCCResolverWrapper(cc *ClientConn) (*ccResolverWrapper, error) {
 	}
 
 	var err error
+	// 创建Resolver
 	ccr.resolver, err = rb.Build(cc.parsedTarget, ccr, resolver.BuildOption{DisableServiceConfig: cc.dopts.disableServiceConfig})
 	if err != nil {
 		return nil, err
@@ -93,6 +96,7 @@ func newCCResolverWrapper(cc *ClientConn) (*ccResolverWrapper, error) {
 	return ccr, nil
 }
 
+// 触发resolver
 func (ccr *ccResolverWrapper) resolveNow(o resolver.ResolveNowOption) {
 	ccr.resolver.ResolveNow(o)
 }
@@ -106,6 +110,7 @@ func (ccr *ccResolverWrapper) isDone() bool {
 	return atomic.LoadUint32(&ccr.done) == 1
 }
 
+// resolver回调接口，通知服务列表和服务配置更新
 func (ccr *ccResolverWrapper) UpdateState(s resolver.State) {
 	if ccr.isDone() {
 		return
@@ -114,6 +119,7 @@ func (ccr *ccResolverWrapper) UpdateState(s resolver.State) {
 	if channelz.IsOn() {
 		ccr.addChannelzTraceEvent(s)
 	}
+	// 调用ClientConn.updateResolverState
 	ccr.cc.updateResolverState(s)
 	ccr.curState = s
 }

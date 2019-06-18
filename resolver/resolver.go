@@ -39,6 +39,7 @@ var (
 // NOTE: this function must only be called during initialization time (i.e. in
 // an init() function), and is not thread-safe. If multiple Resolvers are
 // registered with the same name, the one registered last will take effect.
+// 根据scheme注册ResolverBuilder
 func Register(b Builder) {
 	m[b.Scheme()] = b
 }
@@ -73,6 +74,7 @@ type AddressType uint8
 
 const (
 	// Backend indicates the address is for a backend server.
+	// 默认后端服务地址
 	Backend AddressType = iota
 	// GRPCLB indicates the address is for a grpclb load balancer.
 	GRPCLB
@@ -82,8 +84,10 @@ const (
 // This is the EXPERIMENTAL API and may be changed or extended in the future.
 type Address struct {
 	// Addr is the server address on which a connection will be established.
+	// 服务地址
 	Addr string
 	// Type is the type of this address.
+	// 地址类型
 	Type AddressType
 	// ServerName is the name of this address.
 	//
@@ -119,19 +123,23 @@ type State struct {
 // brand new implementation of this interface. For the situations like
 // testing, the new implementation should embed this interface. This allows
 // gRPC to add new methods to this interface.
+// ClientConn用于提供供Resolver回调的接口
 type ClientConn interface {
 	// UpdateState updates the state of the ClientConn appropriately.
+	// 服务列表和服务配置更新回调接口
 	UpdateState(State)
 	// NewAddress is called by resolver to notify ClientConn a new list
 	// of resolved addresses.
 	// The address list should be the complete list of resolved addresses.
 	//
 	// Deprecated: Use UpdateState instead.
+	// 服务列表更新通知接口
 	NewAddress(addresses []Address)
 	// NewServiceConfig is called by resolver to notify ClientConn a new
 	// service config. The service config should be provided as a json string.
 	//
 	// Deprecated: Use UpdateState instead.
+	// 服务配置更新通知接口
 	NewServiceConfig(serviceConfig string)
 }
 
@@ -159,6 +167,7 @@ type Target struct {
 }
 
 // Builder creates a resolver that will be used to watch name resolution updates.
+// Builder用于创建对应scheme的Resolver
 type Builder interface {
 	// Build creates a new resolver for the given target.
 	//
@@ -175,11 +184,13 @@ type ResolveNowOption struct{}
 
 // Resolver watches for the updates on the specified target.
 // Updates include address updates and service config updates.
+// Resolver根据target返回对应的服务列表，服务发现
 type Resolver interface {
 	// ResolveNow will be called by gRPC to try to resolve the target name
 	// again. It's just a hint, resolver can ignore this if it's not necessary.
 	//
 	// It could be called multiple times concurrently.
+	// 马上重新解析target
 	ResolveNow(ResolveNowOption)
 	// Close closes the resolver.
 	Close()

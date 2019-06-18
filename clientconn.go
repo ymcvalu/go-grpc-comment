@@ -174,6 +174,7 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 		cc.csMgr.channelzID = cc.channelzID
 	}
 
+	// tls连接加密证书相关检查
 	if !cc.dopts.insecure {
 		if cc.dopts.copts.TransportCredentials == nil && cc.dopts.copts.CredsBundle == nil {
 			return nil, errNoTransportSecurity
@@ -192,15 +193,19 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 		}
 	}
 
+	// 如果提供了服务配置
 	if cc.dopts.defaultServiceConfigRawJSON != nil {
 		sc, err := parseServiceConfig(*cc.dopts.defaultServiceConfigRawJSON)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %v", invalidDefaultServiceConfigErrPrefix, err)
 		}
+		// 设置默认服务配置
 		cc.dopts.defaultServiceConfig = sc
 	}
+
 	cc.mkp = cc.dopts.copts.KeepaliveParams
 
+	// 如果没有提供dial，则默认使用ProxyDialer，会根据系统环境变量的代理配置进行网络连接
 	if cc.dopts.copts.Dialer == nil {
 		cc.dopts.copts.Dialer = newProxyDialer(
 			func(ctx context.Context, addr string) (net.Conn, error) {
@@ -210,12 +215,14 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 		)
 	}
 
+	// 用户代理添加grpcUA
 	if cc.dopts.copts.UserAgent != "" {
 		cc.dopts.copts.UserAgent += " " + grpcUA
 	} else {
 		cc.dopts.copts.UserAgent = grpcUA
 	}
 
+	// 如果options设置了timeout
 	if cc.dopts.timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, cc.dopts.timeout)
@@ -230,27 +237,35 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 	}()
 
 	scSet := false
+	// 如果提供了scChan，支持对serviceConfig进行热更
 	if cc.dopts.scChan != nil {
 		// Try to get an initial service config.
 		select {
+		// 尝试获取初始的serviceConfig
 		case sc, ok := <-cc.dopts.scChan:
 			if ok {
 				cc.sc = &sc
-				scSet = true
+				scSet = true // 成功获取初始的serviceConfig
 			}
 		default:
 		}
 	}
+	// 提供retry时的退避算法
 	if cc.dopts.bs == nil {
 		cc.dopts.bs = backoff.Exponential{
 			MaxDelay: DefaultBackoffConfig.MaxDelay,
 		}
 	}
+
+	// resolverBuilder，用于解析target为目标服务列表
+	// 如果没有指定resolverBuilder
 	if cc.dopts.resolverBuilder == nil {
 		// Only try to parse target when resolver builder is not already set.
+		// 解析target，根据target的scheme获取对应的resolver
 		cc.parsedTarget = parseTarget(cc.target)
 		grpclog.Infof("parsed scheme: %q", cc.parsedTarget.Scheme)
 		cc.dopts.resolverBuilder = resolver.Get(cc.parsedTarget.Scheme)
+		// 如果没有的话，使用默认的resolver
 		if cc.dopts.resolverBuilder == nil {
 			// If resolver builder is still nil, the parsed target's scheme is
 			// not registered. Fallback to default resolver and set Endpoint to
@@ -265,6 +280,8 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 	} else {
 		cc.parsedTarget = resolver.Target{Endpoint: target}
 	}
+
+	// 连接证书
 	creds := cc.dopts.copts.TransportCredentials
 	if creds != nil && creds.Info().ServerName != "" {
 		cc.authority = creds.Info().ServerName
@@ -276,6 +293,7 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 		cc.authority = cc.parsedTarget.Endpoint
 	}
 
+	// 如果提供了scChan但是还没有获取到初始的serviceConfig，则阻塞等待serviceConfig
 	if cc.dopts.scChan != nil && !scSet {
 		// Blocking wait for the initial service config.
 		select {
@@ -287,6 +305,7 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 			return nil, ctx.Err()
 		}
 	}
+	// 启动子协程，监听scChan，进行serviceConfig的热更
 	if cc.dopts.scChan != nil {
 		go cc.scWatcher()
 	}
@@ -295,6 +314,7 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 	if creds := cc.dopts.copts.TransportCredentials; creds != nil {
 		credsClone = creds.Clone()
 	}
+	// balancerBuild的options
 	cc.balancerBuildOpts = balancer.BuildOptions{
 		DialCreds:        credsClone,
 		CredsBundle:      cc.dopts.copts.CredsBundle,
@@ -304,6 +324,7 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 	}
 
 	// Build the resolver.
+	// 创建resovler，并包装成resolverWrapper
 	rWrapper, err := newCCResolverWrapper(cc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build resolver: %v", err)
@@ -313,9 +334,11 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 	cc.resolverWrapper = rWrapper
 	cc.mu.Unlock()
 	// A blocking dial blocks until the clientConn is ready.
+	// 默认Dial不会等待网络连接完成，如果指定了blcok，则会阻塞等待网络连接完成才返回
 	if cc.dopts.block {
 		for {
 			s := cc.GetState()
+			// 如果已经Ready
 			if s == connectivity.Ready {
 				break
 			} else if cc.dopts.copts.FailOnNonTempDialError && s == connectivity.TransientFailure {
@@ -328,6 +351,7 @@ func DialContext(ctx context.Context, target string, opts ...DialOption) (conn *
 					}
 				}
 			}
+			// 等待状态变更
 			if !cc.WaitForStateChange(ctx, s) {
 				// ctx got timeout or canceled.
 				return nil, ctx.Err()
@@ -561,7 +585,7 @@ func (cc *ClientConn) updateResolverState(s resolver.State) error {
 		cc.applyServiceConfig(sc)
 	}
 
-	// 负载均衡配置
+	// 负载均衡器变更
 	var balCfg serviceconfig.LoadBalancingConfig
 	// 如果options中没有指定balancerBuilder，则根据serviceConfig更新balancer
 	if cc.dopts.balancerBuilder == nil {
@@ -598,7 +622,7 @@ func (cc *ClientConn) updateResolverState(s resolver.State) error {
 		cc.balancerWrapper = newCCBalancerWrapper(cc, cc.dopts.balancerBuilder, cc.balancerBuildOpts)
 	}
 
-	// 通知变更
+	// 通知Balancer变更
 	cc.balancerWrapper.updateClientConnState(&balancer.ClientConnState{ResolverState: s, BalancerConfig: balCfg})
 	return nil
 }

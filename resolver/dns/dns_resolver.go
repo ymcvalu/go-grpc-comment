@@ -103,16 +103,20 @@ type dnsBuilder struct {
 }
 
 // Build creates and starts a DNS resolver that watches the name resolution of the target.
+// 创建Resolver
 func (b *dnsBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts resolver.BuildOption) (resolver.Resolver, error) {
+	// 解析target
 	host, port, err := parseTarget(target.Endpoint, defaultPort)
 	if err != nil {
 		return nil, err
 	}
 
 	// IP address.
+	// 如果target是ip地址
 	if net.ParseIP(host) != nil {
 		host, _ = formatIP(host)
 		addr := []resolver.Address{{Addr: host + ":" + port}}
+		// 返回ipResolver
 		i := &ipResolver{
 			cc: cc,
 			ip: addr,
@@ -134,7 +138,7 @@ func (b *dnsBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts 
 		ctx:                  ctx,
 		cancel:               cancel,
 		cc:                   cc,
-		t:                    time.NewTimer(0),
+		t:                    time.NewTimer(0), // 初始timer为0
 		rn:                   make(chan struct{}, 1),
 		disableServiceConfig: opts.DisableServiceConfig,
 	}
@@ -149,6 +153,7 @@ func (b *dnsBuilder) Build(target resolver.Target, cc resolver.ClientConn, opts 
 	}
 
 	d.wg.Add(1)
+	// 启动子协程，监听变更
 	go d.watcher()
 	return d, nil
 }
@@ -240,33 +245,46 @@ func (d *dnsResolver) watcher() {
 	defer d.wg.Done()
 	for {
 		select {
+		// 取消了
 		case <-d.ctx.Done():
 			return
+			// 定时更新
 		case <-d.t.C:
+			// 调用了ResolveNow，要求立即更新
 		case <-d.rn:
+			// 尝试停止timer
 			if !d.t.Stop() {
 				// Before resetting a timer, it should be stopped to prevent racing with
 				// reads on it's channel.
+				// timer已经过期，消费一下
 				<-d.t.C
 			}
 		}
 
+		// lookup一下
 		result, sc := d.lookup()
 		// Next lookup should happen within an interval defined by d.freq. It may be
 		// more often due to exponential retry on empty address list.
+		// 如果解析到的服务列表为空
 		if len(result) == 0 {
+			// 重试
 			d.retryCount++
+			// 根据退避算法决定下一次重试时间
 			d.t.Reset(d.backoff.Backoff(d.retryCount))
 		} else {
+			// 解析成功，清除重试计数
 			d.retryCount = 0
 			d.t.Reset(d.freq)
 		}
+		// 调用callback通知更新
 		d.cc.NewServiceConfig(sc)
 		d.cc.NewAddress(result)
 
 		// Sleep to prevent excessive re-resolutions. Incoming resolution requests
 		// will be queued in d.rn.
+		// sleep一下
 		t := time.NewTimer(minDNSResRate)
+		// 这里的select好像多余了？
 		select {
 		case <-t.C:
 		case <-d.ctx.Done():
