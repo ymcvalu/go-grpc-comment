@@ -171,15 +171,20 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 			Val: *config.MaxHeaderListSize,
 		})
 	}
+
+	// 第一帧必须为SETTINGS_FRAME
 	if err := framer.fr.WriteSettings(isettings...); err != nil {
 		return nil, connectionErrorf(false, err, "transport: %v", err)
 	}
 	// Adjust the connection flow control window if needed.
+	// 更新窗口大小
 	if delta := uint32(icwz - defaultWindowSize); delta > 0 {
 		if err := framer.fr.WriteWindowUpdate(0, delta); err != nil {
 			return nil, connectionErrorf(false, err, "transport: %v", err)
 		}
 	}
+
+	// keepalive配置
 	kp := config.KeepaliveParams
 	if kp.MaxConnectionIdle == 0 {
 		kp.MaxConnectionIdle = defaultMaxConnectionIdle
@@ -226,7 +231,9 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 		initialWindowSize: iwz,
 		czData:            new(channelzData),
 	}
+
 	t.controlBuf = newControlBuffer(t.ctxDone)
+
 	if dynamicWindow {
 		t.bdpEst = &bdpEstimator{
 			bdp:               initialWindowSize,
@@ -244,6 +251,7 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 	if channelz.IsOn() {
 		t.channelzID = channelz.RegisterNormalSocket(t, config.ChannelzParentID, fmt.Sprintf("%s -> %s", t.remoteAddr, t.localAddr))
 	}
+	// flush缓存
 	t.framer.writer.Flush()
 
 	defer func() {
@@ -253,6 +261,7 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 	}()
 
 	// Check the validity of client preface.
+	// 读取clientPreface
 	preface := make([]byte, len(clientPreface))
 	if _, err := io.ReadFull(t.conn, preface); err != nil {
 		return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to receive the preface from client: %v", err)
@@ -261,6 +270,7 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 		return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams received bogus greeting from client: %q", preface)
 	}
 
+	// 读取第一个frame，必须为SETTING_FRAME
 	frame, err := t.framer.fr.ReadFrame()
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
 		return nil, err
@@ -269,12 +279,15 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 		return nil, connectionErrorf(false, err, "transport: http2Server.HandleStreams failed to read initial settings frame: %v", err)
 	}
 	atomic.StoreUint32(&t.activity, 1)
+	// 第一个帧必须为SETTING_FRAME
 	sf, ok := frame.(*http2.SettingsFrame)
 	if !ok {
 		return nil, connectionErrorf(false, nil, "transport: http2Server.HandleStreams saw invalid preface type %T from client", frame)
 	}
+	// 应用SETTING_FRAME
 	t.handleSettings(sf)
 
+	// 开启写子协程
 	go func() {
 		t.loopy = newLoopyWriter(serverSide, t.framer, t.controlBuf, t.bdpEst)
 		t.loopy.ssGoAwayHandler = t.outgoingGoAwayHandler
@@ -284,6 +297,8 @@ func newHTTP2Server(conn net.Conn, config *ServerConfig) (_ ServerTransport, err
 		t.conn.Close()
 		close(t.writerDone)
 	}()
+
+	// keepalive协程
 	go t.keepalive()
 	return t, nil
 }
@@ -307,6 +322,7 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 	}
 
 	buf := newRecvBuffer()
+	// 创建对应的stream
 	s := &Stream{
 		id:             streamID,
 		st:             t,
@@ -334,12 +350,16 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 	}
 	s.ctx = peer.NewContext(s.ctx, pr)
 	// Attach the received metadata to the context.
+	// 包含metadata
 	if len(state.data.mdata) > 0 {
 		s.ctx = metadata.NewIncomingContext(s.ctx, state.data.mdata)
 	}
+
+	// 包含statsTags
 	if state.data.statsTags != nil {
 		s.ctx = stats.SetIncomingTags(s.ctx, state.data.statsTags)
 	}
+
 	if state.data.statsTrace != nil {
 		s.ctx = stats.SetIncomingTrace(s.ctx, state.data.statsTrace)
 	}
@@ -375,6 +395,7 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 		})
 		return false
 	}
+	// streamID需要是单号
 	if streamID%2 != 1 || streamID <= t.maxStreamID {
 		t.mu.Unlock()
 		// illegal gRPC stream id.
@@ -382,6 +403,7 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 		return true
 	}
 	t.maxStreamID = streamID
+	// 加入到activeStreams中
 	t.activeStreams[streamID] = s
 	if len(t.activeStreams) == 1 {
 		t.idle = time.Time{}
@@ -423,6 +445,7 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 		streamID: s.id,
 		wq:       s.wq,
 	})
+	// 处理rpc请求
 	handle(s)
 	return false
 }
@@ -433,6 +456,7 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
 func (t *http2Server) HandleStreams(handle func(*Stream), traceCtx func(context.Context, string) context.Context) {
 	defer close(t.readerDone)
 	for {
+		// 循环读取frame
 		frame, err := t.framer.fr.ReadFrame()
 		atomic.StoreUint32(&t.activity, 1)
 		if err != nil {
@@ -462,11 +486,14 @@ func (t *http2Server) HandleStreams(handle func(*Stream), traceCtx func(context.
 			return
 		}
 		switch frame := frame.(type) {
+		// 处理Header帧，rpc调用先发送header帧
 		case *http2.MetaHeadersFrame:
+			// 处理header帧
 			if t.operateHeaders(frame, handle, traceCtx) {
 				t.Close()
 				break
 			}
+			// 处理数据帧，将数据交付给目标stream
 		case *http2.DataFrame:
 			t.handleData(frame)
 		case *http2.RSTStreamFrame:
@@ -578,6 +605,7 @@ func (t *http2Server) handleData(f *http2.DataFrame) {
 		t.controlBuf.put(bdpPing)
 	}
 	// Select the right stream to dispatch.
+	// 获取对应的目标stream
 	s, ok := t.getStream(f)
 	if !ok {
 		return
@@ -808,7 +836,7 @@ func (t *http2Server) WriteStatus(s *Stream, st *status.Status) error {
 	// TODO(mmukhi): Benchmark if the performance gets better if count the metadata and other header fields
 	// first and create a slice of that exact size.
 	headerFields := make([]hpack.HeaderField, 0, 2) // grpc-status and grpc-message will be there if none else.
-	if !s.updateHeaderSent() {                      // No headers have been sent.
+	if !s.updateHeaderSent() { // No headers have been sent.
 		if len(s.header) > 0 { // Send a separate header frame.
 			if err := t.writeHeaderLocked(s); err != nil {
 				s.hdrMu.Unlock()

@@ -379,20 +379,22 @@ func MaxHeaderListSize(s uint32) ServerOption {
 // NewServer creates a gRPC server which has no service registered and has not
 // started to accept requests yet.
 func NewServer(opt ...ServerOption) *Server {
+	// options
 	opts := defaultServerOptions
 	for _, o := range opt {
 		o.apply(&opts)
 	}
+
 	s := &Server{
-		lis:    make(map[net.Listener]bool),
-		opts:   opts,
-		conns:  make(map[io.Closer]bool),
-		m:      make(map[string]*service),
+		lis:    make(map[net.Listener]bool), // net.Listener
+		opts:   opts,                        // options
+		conns:  make(map[io.Closer]bool),    // 客户端连接
+		m:      make(map[string]*service),   // 注册的service
 		quit:   make(chan struct{}),
 		done:   make(chan struct{}),
 		czData: new(channelzData),
 	}
-	s.cv = sync.NewCond(&s.mu)
+	s.cv = sync.NewCond(&s.mu) // condition
 	if EnableTracing {
 		_, file, line, _ := runtime.Caller(1)
 		s.events = trace.NewEventLog("grpc.Server", fmt.Sprintf("%s:%d", file, line))
@@ -423,9 +425,29 @@ func (s *Server) errorf(format string, a ...interface{}) {
 // RegisterService registers a service and its implementation to the gRPC
 // server. It is called from the IDL generated code. This must be called before
 // invoking Serve.
+// a ServiceDesc demo:
+//	var _EchoSvc_serviceDesc = grpc.ServiceDesc{
+//		ServiceName: "proto.EchoSvc",
+//		HandlerType: (*EchoSvcServer)(nil),
+//		Methods: []grpc.MethodDesc{
+//			{
+//				MethodName: "Echo",
+//				Handler:    _EchoSvc_Echo_Handler,
+//			},
+//		},
+//		Streams:  []grpc.StreamDesc{},
+//		Metadata: "echo.proto",
+//	}
+//
+//  func RegisterEchoSvcServer(s *grpc.Server, srv EchoSvcServer) {
+//	  s.RegisterService(&_EchoSvc_serviceDesc, srv)
+//  }
 func (s *Server) RegisterService(sd *ServiceDesc, ss interface{}) {
+	// 服务接口类型
 	ht := reflect.TypeOf(sd.HandlerType).Elem()
+	// 具体的服务类型
 	st := reflect.TypeOf(ss)
+	// st必须实现ht
 	if !st.Implements(ht) {
 		grpclog.Fatalf("grpc: Server.RegisterService found the handler of type %v that does not satisfy %v", st, ht)
 	}
@@ -436,22 +458,27 @@ func (s *Server) register(sd *ServiceDesc, ss interface{}) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.printf("RegisterService(%q)", sd.ServiceName)
+	// 已经运行，不允许register
 	if s.serve {
 		grpclog.Fatalf("grpc: Server.RegisterService after Server.Serve for %q", sd.ServiceName)
 	}
+	// 如果已经注册，不允许重复注册
 	if _, ok := s.m[sd.ServiceName]; ok {
 		grpclog.Fatalf("grpc: Server.RegisterService found duplicate service registration for %q", sd.ServiceName)
 	}
+	// service
 	srv := &service{
 		server: ss,
 		md:     make(map[string]*MethodDesc),
 		sd:     make(map[string]*StreamDesc),
 		mdata:  sd.Metadata,
 	}
+	// 保存methods信息到md中
 	for i := range sd.Methods {
 		d := &sd.Methods[i]
 		srv.md[d.MethodName] = d
 	}
+	// 保存stream信息到sd中
 	for i := range sd.Streams {
 		d := &sd.Streams[i]
 		srv.sd[d.StreamName] = d
@@ -545,7 +572,7 @@ func (l *listenSocket) Close() error {
 func (s *Server) Serve(lis net.Listener) error {
 	s.mu.Lock()
 	s.printf("serving")
-	s.serve = true
+	s.serve = true // 标记serving
 	if s.lis == nil {
 		// Serve called after Stop or GracefulStop.
 		s.mu.Unlock()
@@ -564,6 +591,7 @@ func (s *Server) Serve(lis net.Listener) error {
 		}
 	}()
 
+	// 添加到s.lis中
 	ls := &listenSocket{Listener: lis}
 	s.lis[ls] = true
 
@@ -584,7 +612,7 @@ func (s *Server) Serve(lis net.Listener) error {
 	var tempDelay time.Duration // how long to sleep on accept failure
 
 	for {
-		rawConn, err := lis.Accept()
+		rawConn, err := lis.Accept() // 新的连接到来
 		if err != nil {
 			if ne, ok := err.(interface {
 				Temporary() bool
@@ -627,6 +655,7 @@ func (s *Server) Serve(lis net.Listener) error {
 		// Make sure we account for the goroutine so GracefulStop doesn't nil out
 		// s.conns before this conn can be added.
 		s.serveWG.Add(1)
+		// 启动一个子协程，处理客户端连接
 		go func() {
 			s.handleRawConn(rawConn)
 			s.serveWG.Done()
@@ -638,6 +667,7 @@ func (s *Server) Serve(lis net.Listener) error {
 // has not had any I/O performed on it yet.
 func (s *Server) handleRawConn(rawConn net.Conn) {
 	rawConn.SetDeadline(time.Now().Add(s.opts.connectionTimeout))
+	// ssl/tls连接握手
 	conn, authInfo, err := s.useTransportAuthenticator(rawConn)
 	if err != nil {
 		// ErrConnDispatched means that the connection was dispatched away from
@@ -662,17 +692,22 @@ func (s *Server) handleRawConn(rawConn net.Conn) {
 	s.mu.Unlock()
 
 	// Finish handshaking (HTTP2)
+	// 创建http2Transport
 	st := s.newHTTP2Transport(conn, authInfo)
 	if st == nil {
 		return
 	}
 
 	rawConn.SetDeadline(time.Time{})
+	// 添加到Server.conns中
 	if !s.addConn(st) {
 		return
 	}
+	// 启动子协程，监听rpc
 	go func() {
+		// 监听rpc
 		s.serveStreams(st)
+		// 从conns中移除
 		s.removeConn(st)
 	}()
 }
@@ -694,6 +729,7 @@ func (s *Server) newHTTP2Transport(c net.Conn, authInfo credentials.AuthInfo) tr
 		ChannelzParentID:      s.channelzID,
 		MaxHeaderListSize:     s.opts.maxHeaderListSize,
 	}
+	// 创建http2Server
 	st, err := transport.NewServerTransport("http2", c, config)
 	if err != nil {
 		s.mu.Lock()
@@ -710,10 +746,14 @@ func (s *Server) newHTTP2Transport(c net.Conn, authInfo credentials.AuthInfo) tr
 func (s *Server) serveStreams(st transport.ServerTransport) {
 	defer st.Close()
 	var wg sync.WaitGroup
+	// 处理rpc调用，每个rpc调用对应一条stream
 	st.HandleStreams(func(stream *transport.Stream) {
+		// 有rpc请求进来则使用该方法处理
 		wg.Add(1)
+		// 子协程处理rpc调用
 		go func() {
 			defer wg.Done()
+			// 处理rpc请求
 			s.handleStream(st, stream, s.traceInfo(st, stream))
 		}()
 	}, func(ctx context.Context, method string) context.Context {
@@ -723,6 +763,7 @@ func (s *Server) serveStreams(st transport.ServerTransport) {
 		tr := trace.New("grpc.Recv."+methodFamily(method), method)
 		return trace.NewContext(ctx, tr)
 	})
+	// 等待该transport的所有rpc调用结束
 	wg.Wait()
 }
 
@@ -834,21 +875,25 @@ func (s *Server) incrCallsFailed() {
 }
 
 func (s *Server) sendResponse(t transport.ServerTransport, stream *transport.Stream, msg interface{}, cp Compressor, opts *transport.Options, comp encoding.Compressor) error {
+	// 序列化msg
 	data, err := encode(s.getCodec(stream.ContentSubtype()), msg)
 	if err != nil {
 		grpclog.Errorln("grpc: server failed to encode response: ", err)
 		return err
 	}
+	// 压缩
 	compData, err := compress(data, cp, comp)
 	if err != nil {
 		grpclog.Errorln("grpc: server failed to compress response: ", err)
 		return err
 	}
+	// 生成hdr和payload
 	hdr, payload := msgHeader(data, compData)
 	// TODO(dfawley): should we be checking len(data) instead?
 	if len(payload) > s.opts.maxSendMessageSize {
 		return status.Errorf(codes.ResourceExhausted, "grpc: trying to send message larger than max (%d vs. %d)", len(payload), s.opts.maxSendMessageSize)
 	}
+	// 发送数据给客户端
 	err = t.Write(stream, hdr, payload, opts)
 	if err == nil && s.opts.statsHandler != nil {
 		s.opts.statsHandler.HandleRPC(stream.Context(), outPayload(false, msg, data, payload, time.Now()))
@@ -867,6 +912,7 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 			}
 		}()
 	}
+	// 统计处理
 	sh := s.opts.statsHandler
 	if sh != nil {
 		beginTime := time.Now()
@@ -885,6 +931,7 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 			sh.HandleRPC(stream.Context(), end)
 		}()
 	}
+	// trace处理
 	if trInfo != nil {
 		defer trInfo.tr.Finish()
 		trInfo.tr.LazyLog(&trInfo.firstLine, false)
@@ -895,7 +942,7 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 			}
 		}()
 	}
-
+	// 日志记录
 	binlog := binarylog.GetMethodLogger(stream.Method())
 	if binlog != nil {
 		ctx := stream.Context()
@@ -960,6 +1007,7 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 	if sh != nil || binlog != nil {
 		payInfo = &payloadInfo{}
 	}
+	// 接收并解压缩数据
 	d, err := recvAndDecompress(&parser{r: stream}, stream, dc, s.opts.maxReceiveMessageSize, payInfo, decomp)
 	if err != nil {
 		if st, ok := status.FromError(err); ok {
@@ -972,6 +1020,8 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 	if channelz.IsOn() {
 		t.IncrMsgRecv()
 	}
+
+	// df方法用于从接收的数据包d中反序列化为v
 	df := func(v interface{}) error {
 		if err := s.getCodec(stream.ContentSubtype()).Unmarshal(d, v); err != nil {
 			return status.Errorf(codes.Internal, "grpc: error unmarshalling request: %v", err)
@@ -994,7 +1044,9 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 		}
 		return nil
 	}
+	// 创建context
 	ctx := NewContextWithServerTransportStream(stream.Context(), stream)
+	// 执行handler，这个handler是通过.proto文件生成的，该方法内会去调用server的对应的方法，该方法返回对应的resp
 	reply, appErr := md.Handler(srv.server, ctx, df, s.opts.unaryInt)
 	if appErr != nil {
 		appStatus, ok := status.FromError(appErr)
@@ -1029,7 +1081,7 @@ func (s *Server) processUnaryRPC(t transport.ServerTransport, stream *transport.
 		trInfo.tr.LazyLog(stringer("OK"), false)
 	}
 	opts := &transport.Options{Last: true}
-
+	// 序列化reply给客户端
 	if err := s.sendResponse(t, stream, reply, cp, opts, comp); err != nil {
 		if err == io.EOF {
 			// The entire stream is done (for unary RPC only).
@@ -1098,6 +1150,7 @@ func (s *Server) processStreamingRPC(t transport.ServerTransport, stream *transp
 			}
 		}()
 	}
+	// 统计处理
 	sh := s.opts.statsHandler
 	if sh != nil {
 		beginTime := time.Now()
@@ -1116,7 +1169,9 @@ func (s *Server) processStreamingRPC(t transport.ServerTransport, stream *transp
 			sh.HandleRPC(stream.Context(), end)
 		}()
 	}
+	// 创建用于执行rpc方法的context
 	ctx := NewContextWithServerTransportStream(stream.Context(), stream)
+	// 创建rpc方法中需要用到的stream
 	ss := &serverStream{
 		ctx:                   ctx,
 		t:                     t,
@@ -1129,6 +1184,7 @@ func (s *Server) processStreamingRPC(t transport.ServerTransport, stream *transp
 		statsHandler:          sh,
 	}
 
+	// 日志记录
 	ss.binlog = binarylog.GetMethodLogger(stream.Method())
 	if ss.binlog != nil {
 		md, _ := metadata.FromIncomingContext(ctx)
@@ -1169,6 +1225,7 @@ func (s *Server) processStreamingRPC(t transport.ServerTransport, stream *transp
 	// the incoming message compression method.
 	//
 	// NOTE: this needs to be ahead of all handling, https://github.com/grpc/grpc-go/issues/686.
+	// 设置Compressor
 	if s.opts.cp != nil {
 		ss.cp = s.opts.cp
 		stream.SetSendCompress(s.opts.cp.Type())
@@ -1198,7 +1255,9 @@ func (s *Server) processStreamingRPC(t transport.ServerTransport, stream *transp
 	if srv != nil {
 		server = srv.server
 	}
+	// 如果没有interceptor
 	if s.opts.streamInt == nil {
+		// 直接执行handler，这里的handler是通过.proto文件自动生成的
 		appErr = sd.Handler(server, ss)
 	} else {
 		info := &StreamServerInfo{
@@ -1246,10 +1305,13 @@ func (s *Server) processStreamingRPC(t transport.ServerTransport, stream *transp
 }
 
 func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Stream, trInfo *traceInfo) {
+	// 获取rpc目标方法
 	sm := stream.Method()
+	// 忽略开头的'/'
 	if sm != "" && sm[0] == '/' {
 		sm = sm[1:]
 	}
+	// service/method
 	pos := strings.LastIndex(sm, "/")
 	if pos == -1 {
 		if trInfo != nil {
@@ -1269,21 +1331,28 @@ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Str
 		}
 		return
 	}
+	// 请求目标服务
 	service := sm[:pos]
+	// 请求目标方法
 	method := sm[pos+1:]
-
+	// 获取目标service
 	srv, knownService := s.m[service]
 	if knownService {
+		// 先尝试在md中查找目标方法
 		if md, ok := srv.md[method]; ok {
+			// 执行unaryRPC
 			s.processUnaryRPC(t, stream, srv, md, trInfo)
 			return
 		}
+		// 否则尝试在sd中查找
 		if sd, ok := srv.sd[method]; ok {
+			// 执行流式rpc
 			s.processStreamingRPC(t, stream, srv, sd, trInfo)
 			return
 		}
 	}
 	// Unknown service, or known server unknown method.
+	// 未知服务或者未知方法，如果配置了unknownStreamDesc
 	if unknownDesc := s.opts.unknownStreamDesc; unknownDesc != nil {
 		s.processStreamingRPC(t, stream, nil, unknownDesc, trInfo)
 		return

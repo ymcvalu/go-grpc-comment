@@ -598,6 +598,8 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (_ *Strea
 		}
 
 	}
+
+	// 写入HEADER_FRAME
 	hdr := &headerFrame{
 		hf:        headerFields,
 		endStream: false,
@@ -1342,6 +1344,7 @@ func (t *http2Client) keepalive() {
 	for {
 		select {
 		case <-timer.C:
+			// 定时设置成inactive
 			if atomic.CompareAndSwapUint32(&t.activity, 1, 0) {
 				timer.Reset(t.kp.Time)
 				continue
