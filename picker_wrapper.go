@@ -73,7 +73,7 @@ func (bp *pickerWrapper) updatePicker(p balancer.Picker) {
 	bp.picker = p
 	// bp.blockingCh should never be nil.
 	// close原来的channel
-	close(bp.blockingCh)
+	close(bp.blockingCh) // 通知有新的picker
 	// 重新创建
 	bp.blockingCh = make(chan struct{})
 	bp.mu.Unlock()
@@ -113,14 +113,18 @@ func (bp *pickerWrapper) pick(ctx context.Context, failfast bool, opts balancer.
 			return nil, nil, ErrClientConnClosing
 		}
 
+		// 如果没有picker
 		if bp.picker == nil {
 			ch = bp.blockingCh
 		}
+
+		// 如果没有picker
 		if ch == bp.blockingCh {
 			// This could happen when either:
 			// - bp.picker is nil (the previous if condition), or
 			// - has called pick on the current picker.
 			bp.mu.Unlock()
+			// 等待context取消或者有有picker
 			select {
 			case <-ctx.Done():
 				if connectionErr := bp.connectionError(); connectionErr != nil {
@@ -133,18 +137,20 @@ func (bp *pickerWrapper) pick(ctx context.Context, failfast bool, opts balancer.
 				}
 				return nil, nil, ctx.Err()
 			case <-ch:
+				// 设置了新的picker
 			}
-			continue
+			continue // 重试
 		}
 
 		ch = bp.blockingCh
 		p := bp.picker
 		bp.mu.Unlock()
-
+		// balancer.Picker根据负载均衡策略选取一条连接
 		subConn, done, err := p.Pick(ctx, opts)
 
 		if err != nil {
 			switch err {
+			// 如果没有有效的连接可用，重试
 			case balancer.ErrNoSubConnAvailable:
 				continue
 			case balancer.ErrTransientFailure:
@@ -170,12 +176,17 @@ func (bp *pickerWrapper) pick(ctx context.Context, failfast bool, opts balancer.
 			grpclog.Error("subconn returned from pick is not *acBalancerWrapper")
 			continue
 		}
+
+		// 获取transport
 		if t, ok := acw.getAddrConn().getReadyTransport(); ok {
+			// 获取成功
 			if channelz.IsOn() {
 				return t, doneChannelzWrapper(acw, done), nil
 			}
 			return t, done, nil
 		}
+
+		// 连接不是ready，重新获取
 		if done != nil {
 			// Calling done with nil error, no bytes sent and no bytes received.
 			// DoneInfo with default value works.

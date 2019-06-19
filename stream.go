@@ -313,6 +313,7 @@ func newClientStream(ctx context.Context, desc *StreamDesc, cc *ClientConn, meth
 	// op通过csAttempt创建http2 stream，这里的a.newStream，创建一条stream并设置请求头部信息
 	op := func(a *csAttempt) error { return a.newStream() }
 	// 创建http2 stream
+	// 如果失败会尝试重试，会重新pick一条transport
 	if err := cs.withRetry(op, func() { cs.bufferForRetryLocked(0, op) }); err != nil {
 		// 关闭stream
 		cs.finish(err)
@@ -368,6 +369,7 @@ func (cs *clientStream) newAttemptLocked(sh stats.Handler, trInfo *traceInfo) er
 		return toRPCErr(err)
 	}
 	// picker根据负载均衡策略选择一条transport
+	// done用于结束时的回调，通知负载均衡器该次请求调用信息，以便能够调整负载均衡权重
 	t, done, err := cs.cc.getTransport(cs.ctx, cs.callInfo.failFast, cs.callHdr.Method)
 	if err != nil {
 		return err
@@ -574,11 +576,14 @@ func (cs *clientStream) shouldRetry(err error) error {
 // Returns nil if a retry was performed and succeeded; error otherwise.
 func (cs *clientStream) retryLocked(lastErr error) error {
 	for {
+		// finish掉当前的attempt
 		cs.attempt.finish(lastErr)
+		// 如果返回nil，则应该触发重试
 		if err := cs.shouldRetry(lastErr); err != nil {
 			cs.commitAttemptLocked()
 			return err
 		}
+		// 重新创建一个attempt，会重新pick一条transport
 		if err := cs.newAttemptLocked(nil, nil); err != nil {
 			return err
 		}
@@ -618,6 +623,7 @@ func (cs *clientStream) withRetry(op func(a *csAttempt) error, onSuccess func())
 			cs.mu.Unlock()
 			return err
 		}
+		// 如果err==nil，则触发重试
 		if err := cs.retryLocked(err); err != nil {
 			cs.mu.Unlock()
 			return err
@@ -699,6 +705,7 @@ func (cs *clientStream) SendMsg(m interface{}) (err error) {
 			// errors are converted to an io.EOF error in csAttempt.sendMsg; the real
 			// error will be returned from RecvMsg eventually in that case, or be
 			// retried.)
+			// 如果失败了，finish
 			cs.finish(err)
 		}
 	}()

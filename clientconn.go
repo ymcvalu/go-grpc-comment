@@ -874,7 +874,8 @@ func (cc *ClientConn) healthCheckConfig() *healthCheckConfig {
 }
 
 func (cc *ClientConn) getTransport(ctx context.Context, failfast bool, method string) (transport.ClientTransport, func(balancer.DoneInfo), error) {
-	// picker选择一条来连接
+	// picker根据负载均衡策略选择一条连接
+	// 这里的blockingpicker是balancer.Picker的wrapper
 	t, done, err := cc.blockingpicker.pick(ctx, failfast, balancer.PickOptions{
 		FullMethodName: method,
 	})
@@ -1244,15 +1245,19 @@ func (ac *addrConn) createTransport(addr resolver.Address, copts transport.Conne
 		Authority: ac.cc.authority,
 	}
 
+	// goaway回调
 	onGoAway := func(r transport.GoAwayReason) {
 		ac.mu.Lock()
 		ac.adjustParams(r)
 		ac.mu.Unlock()
+		// 通知触发重连
 		reconnect.Fire()
 	}
 
+	// close回调
 	onClose := func() {
 		close(onCloseCalled)
+		// 通知触发重连
 		reconnect.Fire()
 	}
 
@@ -1266,6 +1271,7 @@ func (ac *addrConn) createTransport(addr resolver.Address, copts transport.Conne
 		copts.ChannelzParentID = ac.channelzID
 	}
 
+	// 创建transport
 	newTr, err := transport.NewClientTransport(connectCtx, ac.cc.ctx, target, copts, onPrefaceReceipt, onGoAway, onClose)
 	if err != nil {
 		// newTr is either nil, or closed.
@@ -1273,6 +1279,7 @@ func (ac *addrConn) createTransport(addr resolver.Address, copts transport.Conne
 		return nil, nil, err
 	}
 
+	// 要求握手
 	if ac.dopts.reqHandshake == envconfig.RequireHandshakeOn {
 		select {
 		case <-time.After(connectDeadline.Sub(time.Now())):
@@ -1350,18 +1357,21 @@ func (ac *addrConn) resetConnectBackoff() {
 // If ac's state is IDLE, it will trigger ac to connect.
 func (ac *addrConn) getReadyTransport() (transport.ClientTransport, bool) {
 	ac.mu.Lock()
+	// 如果是Ready状态
 	if ac.state == connectivity.Ready && ac.transport != nil {
 		t := ac.transport
 		ac.mu.Unlock()
 		return t, true
 	}
 	var idle bool
+	// 如果是Idle状态
 	if ac.state == connectivity.Idle {
 		idle = true
 	}
 	ac.mu.Unlock()
 	// Trigger idle ac to connect.
 	if idle {
+		// 触发连接
 		ac.connect()
 	}
 	return nil, false

@@ -137,15 +137,18 @@ func (b *baseBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.Su
 	}
 	b.scStates[sc] = s
 	switch s {
-	case connectivity.Idle:
-		sc.Connect()
-	case connectivity.Shutdown:
+	case connectivity.Idle: // 连接
+		sc.Connect()        // 重新连接
+	case connectivity.Shutdown: // 已经关闭
 		// When an address was removed by resolver, b called RemoveSubConn but
 		// kept the sc's state in scStates. Remove state for this sc here.
-		delete(b.scStates, sc)
+		delete(b.scStates, sc) // 直接删除
 	}
 
 	oldAggrState := b.state
+	// 如果存在Ready的subConn，则状态为ready
+	// 否则如果存在connecting，则为connecting
+	// 否则为TransientFailure
 	b.state = b.csEvltr.RecordTransition(oldS, s)
 
 	// Regenerate picker when one of the following happens:
@@ -153,11 +156,13 @@ func (b *baseBalancer) UpdateSubConnState(sc balancer.SubConn, state balancer.Su
 	//  - this sc became not-ready from ready
 	//  - the aggregated state of balancer became TransientFailure from non-TransientFailure
 	//  - the aggregated state of balancer became non-TransientFailure from TransientFailure
+	// 如果有新的subConn转变成Ready状态或者转变成TransientFailure，需要重新生成Picker
 	if (s == connectivity.Ready) != (oldS == connectivity.Ready) ||
 		(b.state == connectivity.TransientFailure) != (oldAggrState == connectivity.TransientFailure) {
 		b.regeneratePicker()
 	}
 
+	// 回调更新状态和picker
 	b.cc.UpdateBalancerState(b.state, b.picker)
 }
 

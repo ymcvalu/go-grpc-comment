@@ -303,6 +303,7 @@ func (c *controlBuffer) get(block bool) (interface{}, error) {
 			c.mu.Unlock()
 			return nil, c.err
 		}
+		// 如果队列不为空
 		if !c.list.isEmpty() {
 			h := c.list.dequeue()
 			c.mu.Unlock()
@@ -314,6 +315,7 @@ func (c *controlBuffer) get(block bool) (interface{}, error) {
 		}
 		c.consumerWaiting = true
 		c.mu.Unlock()
+		// 阻塞等待
 		select {
 		case <-c.ch:
 		case <-c.done:
@@ -431,14 +433,18 @@ func (l *loopyWriter) run() (err error) {
 			err = nil
 		}
 	}()
+	// 循环写入
 	for {
+		// 从controlBuf中获取数据，如果没有则阻塞等待
 		it, err := l.cbuf.get(true)
 		if err != nil {
 			return err
 		}
+		// 如果发送数据帧：加入到对应的stream的发送队列，然后将stream加入到activeStreams队列
 		if err = l.handle(it); err != nil {
 			return err
 		}
+		//
 		if _, err = l.processData(); err != nil {
 			return err
 		}
@@ -751,17 +757,19 @@ func (l *loopyWriter) processData() (bool, error) {
 	if l.sendQuota == 0 {
 		return true, nil
 	}
+	// 获取第一个activeStream
 	str := l.activeStreams.dequeue() // Remove the first stream.
 	if str == nil {
 		return true, nil
 	}
+	// 获取第一个等待发送的数据
 	dataItem := str.itl.peek().(*dataFrame) // Peek at the first data item this stream.
 	// A data item is represented by a dataFrame, since it later translates into
 	// multiple HTTP2 data frames.
 	// Every dataFrame has two buffers; h that keeps grpc-message header and d that is acutal data.
 	// As an optimization to keep wire traffic low, data from d is copied to h to make as big as the
 	// maximum possilbe HTTP2 frame size.
-
+	// 如果是空数据帧
 	if len(dataItem.h) == 0 && len(dataItem.d) == 0 { // Empty data frame
 		// Client sends out empty data frame with endStream = true
 		if err := l.framer.fr.WriteData(dataItem.streamID, dataItem.endStream, nil); err != nil {

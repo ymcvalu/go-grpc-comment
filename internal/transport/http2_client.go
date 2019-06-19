@@ -119,6 +119,7 @@ type http2Client struct {
 	onClose  func()
 }
 
+// 创建tcp连接
 func dial(ctx context.Context, fn func(context.Context, string) (net.Conn, error), addr string) (net.Conn, error) {
 	if fn != nil {
 		return fn(ctx, addr)
@@ -145,15 +146,20 @@ func isTemporary(err error) bool {
 // newHTTP2Client constructs a connected ClientTransport to addr based on HTTP2
 // and starts to receive messages on it. Non-nil error returns if construction
 // fails.
+// 创建http2客户端
 func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts ConnectOptions, onPrefaceReceipt func(), onGoAway func(GoAwayReason), onClose func()) (_ *http2Client, err error) {
+	// 默认scheme为http
 	scheme := "http"
+	// 构建cancelContext
 	ctx, cancel := context.WithCancel(ctx)
+	// 如果出现err，则cancel掉
 	defer func() {
 		if err != nil {
 			cancel()
 		}
 	}()
 
+	// 创建目标tcp连接
 	conn, err := dial(connectCtx, opts.Dialer, addr.Addr)
 	if err != nil {
 		if opts.FailOnNonTempDialError {
@@ -161,12 +167,16 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts Conne
 		}
 		return nil, connectionErrorf(true, err, "transport: Error while dialing %v", err)
 	}
+
 	// Any further errors will close the underlying connection
+	// 如果出现err，关闭连接
 	defer func(conn net.Conn) {
 		if err != nil {
 			conn.Close()
 		}
 	}(conn)
+
+	// keepalive参数
 	kp := opts.KeepaliveParams
 	// Validate keepalive parameters.
 	if kp.Time == 0 {
@@ -176,6 +186,7 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts Conne
 		kp.Timeout = defaultClientKeepaliveTimeout
 	}
 	keepaliveEnabled := false
+	// 设置keepaliveTime
 	if kp.Time != infinity {
 		if err = syscall.SetTCPUserTimeout(conn, kp.Timeout); err != nil {
 			return nil, connectionErrorf(false, err, "transport: failed to set TCP_USER_TIMEOUT: %v", err)
@@ -183,10 +194,12 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts Conne
 		keepaliveEnabled = true
 	}
 	var (
-		isSecure bool
+		isSecure bool // 是否使用ssl/tls
 		authInfo credentials.AuthInfo
 	)
+	// 传输层连接证书
 	transportCreds := opts.TransportCredentials
+	// 每次rpc调用证书
 	perRPCCreds := opts.PerRPCCredentials
 
 	if b := opts.CredsBundle; b != nil {
@@ -197,20 +210,29 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts Conne
 			perRPCCreds = append(perRPCCreds, t)
 		}
 	}
+
+	// 如果设置了传输层证书
 	if transportCreds != nil {
+		// 使用https
 		scheme = "https"
+		// 执行ssl/tls握手操作，创建加密连接
 		conn, authInfo, err = transportCreds.ClientHandshake(connectCtx, addr.Authority, conn)
 		if err != nil {
 			return nil, connectionErrorf(isTemporary(err), err, "transport: authentication handshake failed: %v", err)
 		}
-		isSecure = true
+		isSecure = true // 使用ssl/tls
 	}
+
+	// 默认使用动态窗口
 	dynamicWindow := true
 	icwz := int32(initialWindowSize)
+	// 如果指定了初始窗口大小并且大于默认窗口大小
 	if opts.InitialConnWindowSize >= defaultWindowSize {
 		icwz = opts.InitialConnWindowSize
 		dynamicWindow = false
 	}
+
+	// 设置bufSize和maxHeaderListSize
 	writeBufSize := opts.WriteBufferSize
 	readBufSize := opts.ReadBufferSize
 	maxHeaderListSize := defaultClientMaxHeaderListSize
@@ -246,15 +268,18 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts Conne
 		streamQuota:           defaultMaxStreamsClient,
 		streamsQuotaAvailable: make(chan struct{}, 1),
 		czData:                new(channelzData),
-		onGoAway:              onGoAway,
-		onClose:               onClose,
+		onGoAway:              onGoAway, // 设置回调
+		onClose:               onClose,  // 设置回调
 		keepaliveEnabled:      keepaliveEnabled,
 	}
+
+	// 初始化controlBuf
 	t.controlBuf = newControlBuffer(t.ctxDone)
 	if opts.InitialWindowSize >= defaultWindowSize {
 		t.initialWindowSize = opts.InitialWindowSize
 		dynamicWindow = false
 	}
+	// 使用动态窗口
 	if dynamicWindow {
 		t.bdpEst = &bdpEstimator{
 			bdp:               initialWindowSize,
@@ -277,15 +302,20 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts Conne
 	if channelz.IsOn() {
 		t.channelzID = channelz.RegisterNormalSocket(t, opts.ChannelzParentID, fmt.Sprintf("%s -> %s", t.localAddr, t.remoteAddr))
 	}
+
+	// 如果开启keepalive
 	if t.keepaliveEnabled {
 		go t.keepalive()
 	}
 	// Start the reader goroutine for incoming message. Each transport has
 	// a dedicated goroutine which reads HTTP2 frame from network. Then it
 	// dispatches the frame to the corresponding stream entity.
+	// 开启一个reader子协程接收消息，从服务端接收http2 frame并分发到对应的stream
 	go t.reader()
 
 	// Send connection preface to server.
+	// 发送clientPreface
+	// PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n
 	n, err := t.conn.Write(clientPreface)
 	if err != nil {
 		t.Close()
@@ -295,36 +325,47 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts Conne
 		t.Close()
 		return nil, connectionErrorf(true, err, "transport: preface mismatch, wrote %d bytes; want %d", n, len(clientPreface))
 	}
-	var ss []http2.Setting
 
+	// 发送配置帧，连接开始时，必须发送SETTINGS_FRAME
+	var ss []http2.Setting
+	// SETTINGS_INITIAL_WINDOW_SIZE：设置sender的初始窗口大小
 	if t.initialWindowSize != defaultWindowSize {
 		ss = append(ss, http2.Setting{
 			ID:  http2.SettingInitialWindowSize,
 			Val: uint32(t.initialWindowSize),
 		})
 	}
+
+	// SETTINGS_MAX_HEADER_LIST_SIZE：指示sender能够接收的maxHeaderListSize
 	if opts.MaxHeaderListSize != nil {
 		ss = append(ss, http2.Setting{
 			ID:  http2.SettingMaxHeaderListSize,
 			Val: *opts.MaxHeaderListSize,
 		})
 	}
+	// 发送初始配置帧，这里使用golang.org/x/net/http2包
 	err = t.framer.fr.WriteSettings(ss...)
 	if err != nil {
 		t.Close()
 		return nil, connectionErrorf(true, err, "transport: failed to write initial settings frame: %v", err)
 	}
 	// Adjust the connection flow control window if needed.
+	// icwz:初始控制窗口大小
 	if delta := uint32(icwz - defaultWindowSize); delta > 0 {
+		// 发送WINDOW_UPDATE帧，通知增加窗口值
+		// 这里0为保留的streamID，与连接关联
 		if err := t.framer.fr.WriteWindowUpdate(0, delta); err != nil {
 			t.Close()
 			return nil, connectionErrorf(true, err, "transport: failed to write window update: %v", err)
 		}
 	}
 
+	// flush一下
 	if err := t.framer.writer.Flush(); err != nil {
 		return nil, err
 	}
+
+	// 启动一个子协程用于写数据
 	go func() {
 		t.loopy = newLoopyWriter(clientSide, t.framer, t.controlBuf, t.bdpEst)
 		err := t.loopy.run()
@@ -336,7 +377,7 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts Conne
 		if _, ok := err.(net.Error); !ok {
 			t.conn.Close()
 		}
-		close(t.writerDone)
+		close(t.writerDone) // 通知退出写
 	}()
 	return t, nil
 }
@@ -535,10 +576,12 @@ func (t *http2Client) getCallAuthData(ctx context.Context, audience string, call
 // streams.
 func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (_ *Stream, err error) {
 	ctx = peer.NewContext(ctx, t.getPeer())
+	// 根据ctx和callHdr创建header，其中ctx中可能存在metadata
 	headerFields, err := t.createHeaderFields(ctx, callHdr)
 	if err != nil {
 		return nil, err
 	}
+	// 创建stream
 	s := t.newStream(ctx, callHdr)
 	cleanup := func(err error) {
 		if s.swapState(streamDone) == streamDone {
@@ -929,7 +972,7 @@ func (t *http2Client) handleData(f *http2.DataFrame) {
 		t.controlBuf.put(bdpPing)
 	}
 	// Select the right stream to dispatch.
-	s, ok := t.getStream(f)
+	s, ok := t.getStream(f) // 获取对应的stream
 	if !ok {
 		return
 	}
@@ -1214,35 +1257,43 @@ func (t *http2Client) operateHeaders(frame *http2.MetaHeadersFrame) {
 // optimal.
 // TODO(zhaoq): Check the validity of the incoming frame sequence.
 func (t *http2Client) reader() {
-	defer close(t.readerDone)
+	defer close(t.readerDone) // 通知退出读
 	// Check the validity of server preface.
-	frame, err := t.framer.fr.ReadFrame()
+	frame, err := t.framer.fr.ReadFrame() // 读取第一个帧，按照规范，第一个帧必须为SETTINGS_FRAME
 	if err != nil {
 		t.Close() // this kicks off resetTransport, so must be last before return
 		return
 	}
+
 	t.conn.SetReadDeadline(time.Time{}) // reset deadline once we get the settings frame (we didn't time out, yay!)
 	if t.keepaliveEnabled {
-		atomic.CompareAndSwapUint32(&t.activity, 0, 1)
+		atomic.CompareAndSwapUint32(&t.activity, 0, 1) // 设置activity
 	}
+
+	// 按照规范，第一个帧必须为SETTING_FRAME
 	sf, ok := frame.(*http2.SettingsFrame)
 	if !ok {
 		t.Close() // this kicks off resetTransport, so must be last before return
 		return
 	}
+
 	t.onPrefaceReceipt()
+	// 处理设置帧
 	t.handleSettings(sf, true)
 
 	// loop to keep reading incoming messages on this transport.
+	// 循环读取帧
 	for {
+		// 读取下一个帧
 		frame, err := t.framer.fr.ReadFrame()
 		if t.keepaliveEnabled {
-			atomic.CompareAndSwapUint32(&t.activity, 0, 1)
+			atomic.CompareAndSwapUint32(&t.activity, 0, 1) // 设置activity
 		}
 		if err != nil {
 			// Abort an active stream if the http2.Framer returns a
 			// http2.StreamError. This can happen only if the server's response
 			// is malformed http2.
+			// 如果是streamError，不影响其他流
 			if se, ok := err.(http2.StreamError); ok {
 				t.mu.Lock()
 				s := t.activeStreams[se.StreamID]
@@ -1251,15 +1302,18 @@ func (t *http2Client) reader() {
 					// use error detail to provide better err message
 					code := http2ErrConvTab[se.Code]
 					msg := t.framer.fr.ErrorDetail().Error()
+					// 关闭对应的stream
 					t.closeStream(s, status.Error(code, msg), true, http2.ErrCodeProtocol, status.New(code, msg), nil, false)
 				}
 				continue
 			} else {
+				// 关闭整个连接
 				// Transport error.
-				t.Close()
+				t.Close() // 这里的close会触发addrConn的重连，以及resolver的ResolveNow
 				return
 			}
 		}
+		// 根据帧类型进行处理，如果是发送给具体stream的帧，需要交付到对应的stream
 		switch frame := frame.(type) {
 		case *http2.MetaHeadersFrame:
 			t.operateHeaders(frame)
