@@ -641,9 +641,12 @@ func (w *bufWriter) Flush() error {
 	if w.offset == 0 {
 		return nil
 	}
+
+	// callback
 	if w.onFlush != nil {
 		w.onFlush()
 	}
+	// 发送数据到网络上
 	_, w.err = w.conn.Write(w.buf[:w.offset])
 	w.offset = 0
 	return w.err

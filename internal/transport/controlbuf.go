@@ -444,17 +444,19 @@ func (l *loopyWriter) run() (err error) {
 		if err = l.handle(it); err != nil {
 			return err
 		}
-		//
+		// 从activeStreams队列获取第一个stream，发送其发送队列的第一个数据帧
 		if _, err = l.processData(); err != nil {
 			return err
 		}
-		gosched := true
+		gosched := true // 让出cpu
 	hasdata:
 		for {
+			// 不阻塞
 			it, err := l.cbuf.get(false)
 			if err != nil {
 				return err
 			}
+			// 如果存在待发送数据
 			if it != nil {
 				if err = l.handle(it); err != nil {
 					return err
@@ -468,16 +470,22 @@ func (l *loopyWriter) run() (err error) {
 			if err != nil {
 				return err
 			}
+
+			// 如果不为empty，继续发送
 			if !isEmpty {
 				continue hasdata
 			}
+
+			// isEmpty==true
 			if gosched {
 				gosched = false
+				// 如果还没有达到minBatchSize
 				if l.framer.writer.offset < minBatchSize {
-					runtime.Gosched()
+					runtime.Gosched() // 暂时先让出cpu
 					continue hasdata
 				}
 			}
+			// 可能有数据在缓存中，flush一下
 			l.framer.writer.Flush()
 			break hasdata
 

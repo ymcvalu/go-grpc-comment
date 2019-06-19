@@ -360,7 +360,7 @@ func newHTTP2Client(connectCtx, ctx context.Context, addr TargetInfo, opts Conne
 		}
 	}
 
-	// flush一下
+	// flush一下发送缓存
 	if err := t.framer.writer.Flush(); err != nil {
 		return nil, err
 	}
